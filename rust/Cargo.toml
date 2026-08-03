@@ -1,0 +1,25 @@
+[package]
+name = "wks-diary-core"
+version = "0.3.0"
+edition = "2021"
+description = "wks-diary-core backend: stores, serves, merges, and versions encrypted vault blobs"
+
+[[bin]]
+name = "wks-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+lto = true
+strip = true
