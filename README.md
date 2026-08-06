@@ -1,49 +1,48 @@
 # wks-diary-core
 
-`wks-diary-core` is a local-first, encrypted personal diary/knowledge vault. Two components, no third-party naming baggage:
+`wks-diary-core` is a local-first, encrypted personal diary/knowledge vault. Two components: a Rust backend and a Python client.
 
 | Component | Language | Role |
 |---|---|---|
-| `rust/` | Rust | The backend: an always-online server that stores, serves, merges, and **versions** encrypted vault blobs -- restorable like Git commits. |
-| `python/` | Python | The single-file interactive client: run it, enter your key(s) once, then lock/unlock/validate/merge/push/pull/history/restore from one menu. |
+| `rust/` | Rust | Always-online server: stores, serves, LINE-LEVEL merges, versions, prunes, validates, and rate-limits access to encrypted vault blobs. |
+| `python/` | Python | Single-file interactive client: enter your passphrase once, then lock/unlock/validate/merge/push/pull/history/restore from one menu. |
 
-## 1. Data model
+Vault files use the **`.md`** extension throughout (changed from an earlier `.txt` draft -- everything here renders fine as normal Markdown).
+
+## 1. What's new in this revision
+
+1. **Line-level merge (the big one).** Conflicts used to mark an entire file as conflicting the moment both sides touched it. Now the backend (and the Python client's offline mode) run a real diff3-style line-level merge: non-overlapping edits to the same file -- e.g. one device appends a paragraph, another fixes a typo elsewhere -- merge automatically with zero manual work. Only genuinely overlapping edits get `<<<<<<< / ======= / >>>>>>>` markers, scoped to just the conflicting lines.
+2. **Passphrase-derived keys.** Instead of a raw 32-byte key sitting in `.env`, the Python client now derives the vault key from a passphrase you type each run (Argon2id via PyNaCl). Only a non-secret salt is ever persisted. The Rust backend supports the same passphrase mode for manual starts, with raw-key mode kept for unattended systemd restarts (documented trade-off, see `rust/env.example.txt`).
+3. **Rate limiting.** The backend tracks failed `X-API-KEY` attempts in a sliding window and returns `429` once too many failures happen in too short a time, mitigating brute-force key guessing.
+4. **History retention.** Old encrypted blobs beyond `RETENTION_DAYS` get pruned down to one snapshot per calendar week. Log metadata (hash/timestamp/size/device) is kept forever regardless -- you can always see *that* a version existed, even after its blob content has been pruned.
+5. **Server-side validation on every push.** The backend now returns a validation report (unresolved mentions, broken links, alias errors) in the push response, so syntax problems show up immediately instead of only on your next local `validate` run.
+6. **Backup helper.** `backup.sh` for a cron-driven off-site rsync/restic backup of `STORAGE_DIR` -- safe to run as-is since everything in there is already encrypted.
+7. **Bind-address safety check.** The backend refuses to start on a non-loopback address unless you explicitly set `WKS_ALLOW_PUBLIC_BIND=yes`, so accidentally exposing the raw API without a TLS reverse proxy in front is a lot harder.
+8. **Device-tagged history.** Every push can include a `device_name`, stored in the version log, so you can tell which machine made which change when troubleshooting.
+
+## 2. Data model
 
 ```
 vault/
-  diary/kapitel-01/2026-08-03.txt
-  people/max_mustermann.txt
-  misc/ideen.txt
+  diary/kapitel-01/2026-08-03.md
+  people/max_mustermann.md
+  misc/ideen.md
   .meta/last_sync.json
 ```
 
 Markup syntax (`*name*` mentions, `[[links]]`, `#tags`, alias definitions) is documented in `SYNTAX.md` and `SYNTAX_EXAMPLES.md`.
 
-## 2. Encryption & compression pipeline
-
-Compress the whole `vault/` directory into a ZIP, then encrypt with XChaCha20-Poly1305 (libsodium-compatible, 24-byte nonce), giving one opaque `vault.wks` blob. Reverse for unlock. Both the Rust backend and the Python client use the exact same construction, so blobs are interchangeable between them.
-
 ## 3. Rust backend (`rust/`)
 
-An Axum HTTP server with five endpoints:
+Endpoints:
 
-- `GET /version` -> `{hash, updated_at, size, version}` of the current blob
-- `GET /pull` -> streams the current `vault.wks`
-- `POST /push` -> multipart `file` (+ optional `expected_base_hash`); fast-forwards, or auto-merges file-by-file on conflict
-- `GET /history` -> the full version log, newest first -- every push, merge, and restore ever made, like `git log`
-- `POST /restore` -> JSON `{"hash": "<hash>"}`; makes any past version current again, like `git checkout <commit> --`
+- `GET /version` -> `{hash, updated_at, size, version}`
+- `GET /pull` -> streams current `vault.wks`
+- `POST /push` -> multipart `file` (+ `expected_base_hash`, `device_name`); fast-forwards, or line-level auto-merges on conflict; response includes a validation report
+- `GET /history` -> full version log, newest first, including device names and pruned status
+- `POST /restore` -> JSON `{"hash": "..."}`, makes a past version current again (410 Gone if that blob was pruned)
 
-### How versioning/restore works (the "GitHub-style" part)
-
-Every time the current blob changes -- first push, fast-forward, merge, or restore -- the server:
-
-1. Copies whatever was current into `storage/history/<old_hash>.wks` (nothing is ever silently deleted).
-2. Appends an entry to `storage/log.json`: `{version, hash, size, updated_at, mode}`.
-3. Writes the new blob as the new `vault.wks` and updates `storage/meta.json`.
-
-`GET /history` just returns that log, newest first. `POST /restore {"hash": "..."}` looks the requested hash up in `storage/history/`, archives the current blob first (so restoring is itself non-destructive and can be undone), and makes the target the new current version -- exactly like checking out an old commit and having it become your new HEAD. Nothing is ever overwritten without a copy surviving in history first.
-
-Config via `.env` (see `rust/env.example.txt`): `WKS_API_KEY`, `WKS_VAULT_KEY` (32 bytes hex, must match your clients), `STORAGE_DIR`, `MAX_UPLOAD_BYTES`, `BIND_ADDR`.
+Config via `.env` (see `rust/env.example.txt`): `WKS_API_KEY`, `WKS_VAULT_KEY` (Mode A) or `WKS_VAULT_SALT` (Mode B, passphrase prompt), `STORAGE_DIR`, `MAX_UPLOAD_BYTES`, `BIND_ADDR` + `WKS_ALLOW_PUBLIC_BIND`, `RETENTION_DAYS`, `RATE_LIMIT_MAX_FAILURES`, `RATE_LIMIT_WINDOW_SECS`.
 
 ## 4. Python client (`python/wks_diary_core.py`)
 
@@ -52,34 +51,33 @@ pip install pynacl requests
 python wks_diary_core.py
 ```
 
-Prompts for `WKS_VAULT_KEY`, `WKS_API_KEY`, and the backend URL once, then shows a menu:
+Prompts for your vault passphrase (or uses a legacy raw `WKS_VAULT_KEY` if still present), the backend API key, URL, and a device name, then shows a menu:
 
 1. Lock `vault/` -> `vault.wks`
 2. Unlock `vault.wks` -> `vault/`
 3. Validate syntax
 4. Pull from backend
-5. Push to backend (auto-merges on conflict, pulls+unlocks the merged result)
-6. Local merge -- merge two `vault.wks` files entirely offline, no backend
+5. Push to backend (line-level auto-merge on conflict, pulls+unlocks the result, shows the server's validation report)
+6. Local merge -- line-level merge two `vault.wks` files entirely offline, no backend
 7. Check backend version
-8. Show history (like `git log`)
+8. Show history (device names, pruned status, like `git log`)
 9. Restore to a past version (like `git checkout`)
 0. Quit
 
-## 5. Merge strategy
+## 5. How the line-level merge works
 
-File-level three-way merge, implemented identically in Rust and Python:
+For each conflicting file where a common ancestor (`base`) exists, the merge diffs `base -> remote` and `base -> incoming` independently (Myers diff, via the `similar` crate in Rust / `difflib` in Python), then walks both diffs together:
 
-- Unchanged on one side, changed on the other -> take the changed version.
-- Changed identically on both sides -> take either.
-- Changed differently on both sides -> conflict: file gets `<<<<<<< remote / ======= / >>>>>>> incoming` markers, filename listed in the report.
-- Deleted on one side, unchanged on the other -> deletion wins.
-- Deleted on one side, edited on the other -> conflict, edited version kept but flagged.
+- A stretch of lines unchanged in both -> kept as-is.
+- Changed in only one side -> that side's version is taken.
+- Changed identically in both -> either (they agree).
+- Changed differently in both, in the *same* stretch of lines -> `<<<<<<< / ======= / >>>>>>>` markers around just that stretch.
 
-Available online (server-side, via push) or fully offline (client-side, menu option 6).
+Binary files, or files with no shared ancestor (e.g. a brand-new file independently created on both sides with different content), fall back to the old whole-file conflict marker -- always correct, just less automatic.
 
 ## 6. Threat model
 
-The backend holds `WKS_VAULT_KEY` and decrypts in memory during merges and restores -- only run it on infrastructure you fully control. `WKS_API_KEY` and `WKS_VAULT_KEY` are separate secrets: losing the API key only allows push/pull/merge/restore junk; losing the vault key exposes plaintext. Keep `.env` out of git everywhere. Because every past state is preserved in `storage/history/`, a single accidental bad push or merge is always recoverable via `/restore` -- nothing is destructive by default.
+The backend holds the vault key and decrypts on every push (for validation) as well as during merges and restores -- only run it on infrastructure you fully control. `WKS_API_KEY` and the vault key/passphrase are separate secrets with separate blast radii. Rate limiting slows down online key-guessing; it does not protect against someone who already has your `.env`. Because every past state is preserved (subject to the retention/pruning policy), a bad push or merge is recoverable via `/restore` as long as its blob hasn't been pruned yet.
 
 ## 7. Repository layout
 
@@ -89,6 +87,7 @@ wks-diary-core/
   INSTALL.md
   SYNTAX.md
   SYNTAX_EXAMPLES.md
+  backup.sh
   rust/
     Cargo.toml
     src/main.rs

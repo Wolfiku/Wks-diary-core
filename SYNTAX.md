@@ -1,5 +1,7 @@
 # wks-diary-core Markup Syntax Specification
 
+All vault files use the `.md` extension (plain Markdown-compatible text with a few extra reserved constructs). Earlier drafts used `.txt` -- that was changed because everything here is meant to render fine as normal Markdown too, and `.md` makes editors/viewers treat it correctly by default.
+
 ## 1. Core Design Principles
 
 - Every file is plain text and must remain human-readable even without a parser.
@@ -9,10 +11,10 @@
 
 ## 2. Person Definition Block
 
-First non-empty line of every `people/*.txt` file:
+First non-empty line of every `people/*.md` file:
 
 ```
-[*Max Mustermann[max_mustermann.txt]*]
+[*Max Mustermann[max_mustermann.md]*]
 ```
 
 Syntax: `[*<DisplayName>[<filename>]*]`. `<filename>` must exactly match the file's own name.
@@ -20,13 +22,13 @@ Syntax: `[*<DisplayName>[<filename>]*]`. `<filename>` must exactly match the fil
 ### 2.1 Aliases
 
 ```
-[*Max Mustermann[max_mustermann.txt]*]
+[*Max Mustermann[max_mustermann.md]*]
 [aliases: Max, Maxi, Mustermann]
 ```
 
 ## 3. Person Mentions (`*name*`)
 
-`*token*` anywhere resolves via the global alias table built from all `people/*.txt` files.
+`*token*` anywhere resolves via the global alias table built from all `people/*.md` files.
 
 - Exactly one match -> linked.
 - No match -> unresolved mention warning, stays as plain text.
@@ -42,7 +44,7 @@ Escape a literal asterisk: `\*not a mention\*`.
 [[diary/kapitel-01/2026-08-03#morning]]
 ```
 
-Path relative to vault root, extension optional, pipe for display label, `#heading` for section anchor.
+Path relative to vault root, extension optional (resolves to `.md`), pipe for display label, `#heading` for section anchor.
 
 ## 5. Topic Tags (`#tag`)
 
@@ -78,11 +80,13 @@ Lines starting with `//` are ignored by the parser.
 | Self-mismatch | declared filename != actual filename | Error |
 | Duplicate alias | same alias in 2+ people files | Error |
 
+The backend now also runs this validation automatically on every push (after merge/fast-forward) and returns the report in the response, so you see problems immediately instead of only on your next local `validate` run.
+
 ## 9. Reserved Characters Summary
 
 | Syntax | Meaning |
 |---|---|
-| `[*Name[file.txt]*]` | Person definition |
+| `[*Name[file.md]*]` | Person definition |
 | `[aliases: a, b, c]` | Alias list |
 | `*token*` | Person mention |
 | `\*text\*` | Escaped literal asterisks |
@@ -96,3 +100,17 @@ Lines starting with `//` are ignored by the parser.
 ## 10. Backlink Index
 
 Rebuilt on every unlock from vault content; never part of the encrypted payload itself.
+
+## 11. Merge conflict markers
+
+When two edits to the same `.md` file genuinely conflict, the merge inserts standard-looking conflict markers around just the conflicting lines (not the whole file):
+
+```
+<<<<<<< remote
+... server's version of this paragraph ...
+=======
+... your version of this paragraph ...
+>>>>>>> incoming
+```
+
+Resolve by editing the file and removing the markers you don't want, exactly like resolving a Git merge conflict.
