@@ -1,8 +1,8 @@
 [package]
 name = "wks-diary-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "wks-diary-core backend: stores, serves, merges, and versions encrypted vault blobs"
+description = "wks-diary-core backend: stores, serves, merges (line-level), versions, and prunes encrypted vault blobs"
 
 [[bin]]
 name = "wks-server"
@@ -19,6 +19,10 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+similar = "2"
+argon2 = "0.5"
+rpassword = "7"
+regex = "1"
 
 [profile.release]
 lto = true
