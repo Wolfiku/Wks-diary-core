@@ -2,9 +2,9 @@
 //!
 //! Always-online server. Stores the encrypted vault, serves it, performs
 //! LINE-LEVEL three-way merges (diff3-style, via the `similar` crate) when
-//! two pushes diverge, keeps a full GitHub-style version log with pruning,
-//! runs syntax validation on every push, rate-limits failed auth attempts,
-//! and refuses to bind publicly without an explicit opt-in.
+//! two pushes diverge, keeps a full version log with pruning, runs syntax
+//! validation on every push, rate-limits failed auth attempts, and refuses
+//! to bind publicly without an explicit opt-in.
 //!
 //! Endpoints:
 //!   GET  /version   -> current {hash, updated_at, size, version}
@@ -603,7 +603,7 @@ fn validate_blob(key: &[u8; 32], blob: &[u8]) -> Option<serde_json::Value> {
 }
 
 /* ------------------------------------------------------------------ */
-/* Meta + version log (GitHub-style history / restore / retention)   */
+/* Meta + version log (history / restore / retention)                */
 /* ------------------------------------------------------------------ */
 
 #[derive(Serialize, Deserialize, Clone, Default)]
