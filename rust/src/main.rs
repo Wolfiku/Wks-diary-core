@@ -3,8 +3,10 @@
 //! Always-online server. Stores the encrypted vault, serves it, performs
 //! LINE-LEVEL three-way merges (diff3-style, via the `similar` crate) when
 //! two pushes diverge, keeps a full version log with pruning, runs syntax
-//! validation on every push, rate-limits failed auth attempts, and refuses
-//! to bind publicly without an explicit opt-in.
+//! validation on every push, rate-limits failed auth attempts, refuses
+//! to bind publicly without an explicit opt-in, and allows cross-origin
+//! requests (needed for the browser-based PWA client, which sends a
+//! custom X-API-KEY header and therefore triggers a CORS preflight).
 //!
 //! Endpoints:
 //!   GET  /version   -> current {hash, updated_at, size, version}
@@ -40,6 +42,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::Mutex;
+use tower_http::cors::{Any, CorsLayer};
 
 const NONCE_LEN: usize = 24;
 const WEEK_SECS: u64 = 7 * 86_400;
@@ -999,12 +1002,18 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState { cfg, lock: Mutex::new(()), rate_limiter });
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/version", get(version_handler))
         .route("/pull", get(pull_handler))
         .route("/push", post(push_handler))
         .route("/history", get(history_handler))
         .route("/restore", post(restore_handler))
+        .layer(cors)
         .with_state(state);
 
     println!("wks-diary-core backend listening on {bind_addr}");
