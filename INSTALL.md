@@ -1,15 +1,14 @@
 # Installing wks-diary-core
 
-This guide covers installing the Rust backend on any server you control (VPS, home server, Raspberry Pi, a spare laptop) and connecting the Python client from any device. It's written to be provider-agnostic -- swap in whichever Linux distro, reverse proxy, or process manager you already use.
+This guide covers installing the Rust backend on any server you control (VPS, home server, Raspberry Pi, a spare laptop) and connecting any HTTP client from any device. It's written to be provider-agnostic -- swap in whichever Linux distro, reverse proxy, or process manager you already use.
 
 ## 1. What you're setting up
 
-Two independent pieces:
+One piece:
 
 - **Backend** (`rust/`) -- one binary (`wks-server`), runs continuously, holds the encrypted vault and version history. Needs exactly one always-reachable machine.
-- **Client** (`python/wks_diary_core.py`) -- runs on every device you actually write from. No server-side install needed for this part.
 
-You only need to follow the backend steps once, on one machine. Repeat the client steps on as many devices as you want.
+You only need to follow these steps once, on one machine. Clients talk to it over HTTP(S) using the API key.
 
 ## 2. Prerequisites
 
@@ -160,34 +159,29 @@ curl -H "X-API-KEY: <WKS_API_KEY>" https://your-domain.tld/pull -o /dev/null -w 
 
 A fresh install returns `{"hash":null,...}` from `/version`, `[]` from `/history`, and `404` from `/pull` until the first push happens -- all of that is expected.
 
-## 10. Set up the client on every writing device
+## 10. First real use
 
-```bash
-pip install pynacl requests
-python wks_diary_core.py
-```
-
-You'll be prompted for: the vault passphrase (or it reads a legacy raw key if one is already in a local `.env`), the backend API key, the backend URL, and a device name (used only in the version log so you can tell devices apart later). Only the salt, API key, URL, and device name are ever saved locally if you opt in -- the passphrase itself is never written to disk on any device.
-
-## 11. First real use
-
-1. Create a `vault/` folder next to the client script with `diary/`, `people/`, `misc/` subfolders, and start writing `.md` files following `SYNTAX.md`.
-2. Menu option 1 (Lock) to produce `vault.wks`.
-3. Menu option 5 (Push) to send it to the backend for the first time.
-4. On any other device, repeat the client setup, then option 4 (Pull) followed by unlock.
+1. Create a `vault/` folder with `diary/`, `people/`, `misc/` subfolders, and start writing `.md` files following `SYNTAX.md`.
+2. Lock the vault to produce `vault.wks` (encrypt with your vault key).
+3. `POST /push` with the encrypted archive to send it to the backend for the first time.
+4. On any other device, `GET /pull` to fetch the current snapshot, then decrypt locally.
 
 From here on, edit freely on any device; pushes fast-forward when nothing else changed, or merge automatically line-by-line when something did.
 
-## 12. Recovering from a mistake
+## 11. Recovering from a mistake
 
+```bash
+# List all past versions
+curl -H "X-API-KEY: <WKS_API_KEY>" https://your-domain.tld/history
+
+# Make a past version current again
+curl -X POST -H "X-API-KEY: <WKS_API_KEY>" -H "Content-Type: application/json" \
+     -d '{"hash": "<past-hash>"}' https://your-domain.tld/restore
 ```
-8) Show history   -> every past version, its hash, device, and whether it's been pruned
-9) Restore        -> pick a hash, the backend makes it current again
-```
 
-If an entry shows as pruned, its content is gone per your `RETENTION_DAYS` setting but the metadata (hash, timestamp, size, device) stays visible forever; restoring a pruned hash returns `410 Gone`.
+If a version shows as pruned, its content is gone per your `RETENTION_DAYS` setting but the metadata (hash, timestamp, size, device) stays visible forever; restoring a pruned hash returns `410 Gone`.
 
-## 13. Off-site backups
+## 12. Off-site backups
 
 Everything under `STORAGE_DIR` is encrypted except the log's metadata (hashes, timestamps, sizes, device names -- never content), so it's safe to back up as-is with any tool:
 
@@ -200,7 +194,7 @@ BACKUP_TARGET=user@backup-host:/backups/wks-diary-core/ \
 
 Add it to cron or your scheduler of choice; the script itself also documents a `restic` alternative for deduplicated, generation-based backups if you prefer that over plain `rsync`.
 
-## 14. Updating to a newer version later
+## 13. Updating to a newer version later
 
 ```bash
 git pull
@@ -210,13 +204,13 @@ sudo systemctl restart wks-diary-core   # or re-attach your tmux session
 
 Your `.env` and `storage/` are untouched by a `git pull` since they're not tracked in the repository -- only the code changes.
 
-## 15. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Server exits immediately with "refusing to start: BIND_ADDR ... is not loopback-only" | You set a public `BIND_ADDR` without opting in | Set `BIND_ADDR=127.0.0.1:8080` and put a reverse proxy in front, or set `WKS_ALLOW_PUBLIC_BIND=yes` if that's genuinely what you want |
 | "failed to read passphrase from stdin" on startup | Using Mode B under systemd (no TTY) | Either switch to Mode A, or run manually via tmux/screen instead of systemd |
-| `401 unauthorized` from every request | Wrong or missing `X-API-KEY` header | Double-check the header name casing and that the client's `.env`/prompt matches the server's `WKS_API_KEY` exactly |
+| `401 unauthorized` from every request | Wrong or missing `X-API-KEY` header | Double-check the header name casing and that the client's key matches the server's `WKS_API_KEY` exactly |
 | `429 too many failed auth attempts` | Rate limiter tripped, usually from a typo'd key retried repeatedly | Wait out `RATE_LIMIT_WINDOW_SECS`, then double-check the key |
 | `409 conflict` on push that never resolves | The base version referenced by the client is no longer in `storage/history/` (may have been pruned) | Pull the current version fresh, re-apply your local edits, and push again without an `expected_base_hash` |
 | `410 Gone` on restore | That version's blob was pruned by retention policy | Only the metadata survives; the content itself is unrecoverable if it was pruned |

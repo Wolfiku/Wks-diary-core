@@ -18,12 +18,7 @@ You don't "save a file." You **push a new version of your mind**, from whichever
 | `git checkout <commit>` | `restore` -- make any past version current again |
 | Branch | Each device is effectively its own branch until it pushes |
 
-Two components implement this:
-
-| Component | Language | Role |
-|---|---|---|
-| `rust/` | Rust | Always-online backend: stores, serves, line-level merges, versions, prunes, validates, and rate-limits access to your encrypted vault. |
-| `python/` | Python | Single-file interactive client: enter your passphrase once, then write, merge, push, pull, browse history, and restore from one menu. |
+The Rust backend (`rust/`) is the only component -- it runs continuously on a machine you control, stores the encrypted vault and version history, performs line-level merges, validates markup on every push, and rate-limits access. Any HTTP client (curl, your own script, a future GUI) can talk to it.
 
 Vault files use the `.md` extension throughout.
 
@@ -63,7 +58,7 @@ Markup syntax (`*name*` mentions, `[[links]]`, `#tags`, alias definitions) is do
 - **Validation on every push**: the backend checks your markup (unresolved mentions, broken links, alias conflicts) and hands the report straight back to you.
 - **No public exposure by accident**: the backend refuses to bind to a non-loopback address unless you explicitly opt in, so it can't accidentally end up reachable without a TLS proxy in front.
 
-## 7. Rust backend endpoints
+## 7. Backend endpoints
 
 - `GET /version` -> current `{hash, updated_at, size, version}`
 - `GET /pull` -> streams the current encrypted vault
@@ -73,16 +68,7 @@ Markup syntax (`*name*` mentions, `[[links]]`, `#tags`, alias definitions) is do
 
 Config via `.env` (see `rust/env.example.txt`): `WKS_API_KEY`, `WKS_VAULT_KEY` or `WKS_VAULT_SALT`, `STORAGE_DIR`, `MAX_UPLOAD_BYTES`, `BIND_ADDR` + `WKS_ALLOW_PUBLIC_BIND`, `RETENTION_DAYS`, `RATE_LIMIT_MAX_FAILURES`, `RATE_LIMIT_WINDOW_SECS`.
 
-## 8. Python client
-
-```bash
-pip install pynacl requests
-python wks_diary_core.py
-```
-
-Menu: lock/unlock the vault, validate syntax, pull, push (auto-merges, shows conflicts and the validation report), a fully offline local merge between two exported snapshots, history, and restore.
-
-## 9. Repository layout
+## 8. Repository layout
 
 ```
 wks-diary-core/
@@ -95,8 +81,6 @@ wks-diary-core/
     Cargo.toml
     src/main.rs
     env.example.txt
-  python/
-    wks_diary_core.py
 ```
 
 See `INSTALL.md` for step-by-step VPS setup.
