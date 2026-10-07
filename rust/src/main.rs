@@ -37,10 +37,11 @@ use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -58,7 +59,6 @@ struct Config {
     history_dir: PathBuf,
     max_bytes: usize,
     bind_addr: String,
-    retention_days: u64,
     rate_limit_max_failures: usize,
     rate_limit_window: Duration,
 }
@@ -130,7 +130,12 @@ fn load_config() -> Result<Config> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(50 * 1024 * 1024);
     let bind_addr = env.get("BIND_ADDR").cloned().unwrap_or_else(|| "127.0.0.1:8080".into());
-    let retention_days = env.get("RETENTION_DAYS").and_then(|s| s.parse().ok()).unwrap_or(30);
+    if env.contains_key("RETENTION_DAYS") {
+        eprintln!(
+            "note: RETENTION_DAYS is ignored since v0.5.0 -- old data is never deleted \
+             automatically. Use `wks-server prune --older-than-days N --yes` to delete explicitly."
+        );
+    }
     let rate_limit_max_failures = env
         .get("RATE_LIMIT_MAX_FAILURES")
         .and_then(|s| s.parse().ok())
@@ -156,7 +161,6 @@ fn load_config() -> Result<Config> {
         history_dir,
         max_bytes,
         bind_addr,
-        retention_days,
         rate_limit_max_failures,
         rate_limit_window,
     })
@@ -634,75 +638,271 @@ fn default_device_name() -> String {
     "unknown-device".to_string()
 }
 
-async fn read_meta(path: &PathBuf) -> Meta {
-    match fs::read_to_string(path).await {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Meta::default(),
-    }
-}
-
-async fn write_meta(path: &PathBuf, meta: &Meta) -> Result<()> {
-    fs::write(path, serde_json::to_string(meta)?).await?;
-    Ok(())
-}
-
-async fn read_log(path: &PathBuf) -> Vec<LogEntry> {
-    match fs::read_to_string(path).await {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-async fn append_log(path: &PathBuf, entry: LogEntry) -> Result<()> {
-    let mut log = read_log(path).await;
-    log.push(entry);
-    fs::write(path, serde_json::to_string_pretty(&log)?).await?;
-    Ok(())
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
 fn now_iso() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    format!("unix:{now}")
+    format!("unix:{}", now_secs())
 }
 
 fn parse_unix_ts(s: &str) -> Option<u64> {
     s.strip_prefix("unix:").and_then(|v| v.parse().ok())
 }
 
-/// Deletes history blobs older than RETENTION_DAYS, keeping at most one
-/// snapshot per calendar week beyond that window. Log metadata (hash,
-/// timestamp, size) is kept forever regardless -- only the encrypted
-/// blob file itself gets removed, marked with `pruned: true`.
-async fn prune_history(history_dir: &PathBuf, log_path: &PathBuf, retention_days: u64) {
-    let mut log = read_log(log_path).await;
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let cutoff = now_secs.saturating_sub(retention_days * 86_400);
+/// Crash-safe write: temp file in the same directory, fsync, atomic rename.
+/// A crash or full disk can never leave a truncated/half-written target.
+async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = tmp_path(path);
+    let mut f = fs::File::create(&tmp).await?;
+    f.write_all(data).await?;
+    f.sync_all().await?;
+    drop(f);
+    if let Err(e) = fs::rename(&tmp, path).await {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
+    Ok(())
+}
 
-    let mut kept_weeks: HashSet<u64> = HashSet::new();
-    let mut changed = false;
+fn atomic_write_sync(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = tmp_path(path);
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
 
-    for entry in log.iter_mut().rev() {
-        if entry.pruned {
-            continue;
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".tmp-{}", rand::random::<u32>()));
+    path.with_file_name(name)
+}
+
+/// Stores a blob under its hash in history/. Never overwrites an existing
+/// blob (content-addressed) and failure is always fatal for the caller:
+/// a version is only replaced after it has been safely archived.
+async fn archive_blob(history_dir: &Path, hash: &str, bytes: &[u8]) -> Result<()> {
+    fs::create_dir_all(history_dir).await?;
+    let path = history_dir.join(format!("{hash}.wks"));
+    if fs::metadata(&path).await.is_ok() {
+        return Ok(());
+    }
+    atomic_write(&path, bytes).await
+}
+
+/// Moves a corrupt file aside (never deletes it) so it can be inspected.
+async fn quarantine(path: &Path) {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".corrupt-{}", now_secs()));
+    let _ = fs::copy(path, path.with_file_name(name)).await;
+}
+
+/// Loads meta + log and self-heals inconsistencies WITHOUT ever discarding
+/// data: a corrupt log.json aborts the request (it is never overwritten with
+/// an empty one), a missing/corrupt/stale meta.json is rebuilt from the
+/// actual vault.wks, and the vault blob is archived before anything else.
+async fn load_state(storage: &Path, history: &Path) -> Result<(Meta, Vec<LogEntry>)> {
+    let meta_path = storage.join("meta.json");
+    let log_path = storage.join("log.json");
+    let vault_path = storage.join("vault.wks");
+
+    let mut log: Vec<LogEntry> = match fs::read_to_string(&log_path).await {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(l) => l,
+            Err(e) => {
+                quarantine(&log_path).await;
+                bail!("log.json is corrupt ({e}); a copy was kept as log.json.corrupt-*; refusing to continue so nothing is overwritten");
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => bail!("cannot read log.json: {e}"),
+    };
+
+    let mut meta: Meta = match fs::read_to_string(&meta_path).await {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(m) => m,
+            Err(_) => {
+                quarantine(&meta_path).await;
+                Meta::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Meta::default(),
+        Err(e) => bail!("cannot read meta.json: {e}"),
+    };
+
+    let vault = match fs::read(&vault_path).await {
+        Ok(v) => Some(v),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => bail!("cannot read vault.wks: {e}"),
+    };
+
+    match vault {
+        None => {
+            if meta.hash.is_some() {
+                bail!(
+                    "vault.wks is missing although meta.json points to {}; refusing to continue. \
+                     Restore vault.wks from storage/history/<hash>.wks or from backup",
+                    meta.hash.as_deref().unwrap_or("?")
+                );
+            }
         }
-        let ts = parse_unix_ts(&entry.updated_at).unwrap_or(now_secs);
-        if ts >= cutoff {
-            continue;
-        }
-        let week = ts / WEEK_SECS;
-        if kept_weeks.contains(&week) {
-            let blob_path = history_dir.join(format!("{}.wks", entry.hash));
-            let _ = fs::remove_file(&blob_path).await;
-            entry.pruned = true;
-            changed = true;
-        } else {
-            kept_weeks.insert(week);
+        Some(bytes) => {
+            let actual = sha256_hex(&bytes);
+            if meta.hash.as_deref() != Some(actual.as_str()) {
+                archive_blob(history, &actual, &bytes).await?;
+                let version = meta
+                    .version
+                    .unwrap_or(0)
+                    .max(log.last().map(|e| e.version).unwrap_or(0))
+                    + 1;
+                meta = Meta { hash: Some(actual.clone()), updated_at: Some(now_iso()), size: Some(bytes.len() as u64), version: Some(version) };
+                log.push(LogEntry {
+                    version,
+                    hash: actual,
+                    size: bytes.len() as u64,
+                    updated_at: meta.updated_at.clone().unwrap(),
+                    mode: "recovered".to_string(),
+                    device_name: "server-recovery".to_string(),
+                    pruned: false,
+                });
+                atomic_write(&log_path, serde_json::to_string_pretty(&log)?.as_bytes()).await?;
+                atomic_write(&meta_path, serde_json::to_string(&meta)?.as_bytes()).await?;
+            }
         }
     }
+    Ok((meta, log))
+}
 
-    if changed {
-        let _ = fs::write(log_path, serde_json::to_string_pretty(&log).unwrap_or_default()).await;
+/// Makes `blob` the current version: vault.wks, then meta.json, then log.json,
+/// each written atomically. Callers must have archived the previous current
+/// blob (and the incoming one) beforehand.
+async fn commit_version(storage: &Path, meta: &Meta, mut log: Vec<LogEntry>, blob: &[u8], mode: &str, device: &str) -> Result<Meta> {
+    let hash = sha256_hex(blob);
+    atomic_write(&storage.join("vault.wks"), blob).await?;
+    let new_meta = Meta {
+        hash: Some(hash.clone()),
+        updated_at: Some(now_iso()),
+        size: Some(blob.len() as u64),
+        version: Some(meta.version.unwrap_or(0).max(log.last().map(|e| e.version).unwrap_or(0)) + 1),
+    };
+    atomic_write(&storage.join("meta.json"), serde_json::to_string(&new_meta)?.as_bytes()).await?;
+    log.push(LogEntry {
+        version: new_meta.version.unwrap(),
+        hash,
+        size: blob.len() as u64,
+        updated_at: new_meta.updated_at.clone().unwrap(),
+        mode: mode.to_string(),
+        device_name: device.to_string(),
+        pruned: false,
+    });
+    atomic_write(&storage.join("log.json"), serde_json::to_string_pretty(&log)?.as_bytes()).await?;
+    Ok(new_meta)
+}
+
+fn server_error(e: impl std::fmt::Display) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+}
+
+/* ------------------------------------------------------------------ */
+/* Explicit pruning (CLI only: `wks-server prune ...`)                 */
+/* Nothing is ever deleted automatically.                              */
+/* ------------------------------------------------------------------ */
+
+/// Returns the set of blob hashes that may be deleted: entries older than
+/// `cutoff`, never the current version, never a blob that is still referenced
+/// by a newer log entry, and (optionally) one snapshot per calendar week.
+fn plan_prune(log: &[LogEntry], current: Option<&str>, cutoff: u64, keep_weekly: bool) -> HashSet<String> {
+    let mut protected: HashSet<String> = HashSet::new();
+    if let Some(c) = current {
+        protected.insert(c.to_string());
     }
+    let mut candidates: Vec<(&LogEntry, u64)> = Vec::new();
+    for e in log.iter().filter(|e| !e.pruned) {
+        match parse_unix_ts(&e.updated_at) {
+            Some(ts) if ts < cutoff => candidates.push((e, ts)),
+            _ => {
+                protected.insert(e.hash.clone());
+            }
+        }
+    }
+    if keep_weekly {
+        let mut weeks: HashSet<u64> = HashSet::new();
+        for (e, ts) in candidates.iter().rev() {
+            if weeks.insert(ts / WEEK_SECS) {
+                protected.insert(e.hash.clone());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .map(|(e, _)| e.hash.clone())
+        .filter(|h| !protected.contains(h))
+        .collect()
+}
+
+fn run_prune(args: &[String]) -> Result<()> {
+    let mut days: Option<u64> = None;
+    let mut keep_weekly = false;
+    let mut yes = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--older-than-days" => days = it.next().and_then(|v| v.parse().ok()),
+            "--keep-weekly" => keep_weekly = true,
+            "--yes" => yes = true,
+            other => bail!("unknown option '{other}'"),
+        }
+    }
+    let Some(days) = days else {
+        bail!("usage: wks-server prune --older-than-days N [--keep-weekly] [--yes]   (without --yes: dry run)");
+    };
+
+    let env = load_env(".env")?;
+    let storage = PathBuf::from(env.get("STORAGE_DIR").cloned().unwrap_or_else(|| "./storage".into()));
+    let history = storage.join("history");
+    let log_path = storage.join("log.json");
+    let meta: Meta = std::fs::read_to_string(storage.join("meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut log: Vec<LogEntry> = match std::fs::read_to_string(&log_path) {
+        Ok(s) => serde_json::from_str(&s).context("log.json is corrupt; refusing to prune")?,
+        Err(_) => Vec::new(),
+    };
+
+    let cutoff = now_secs().saturating_sub(days * 86_400);
+    let doomed = plan_prune(&log, meta.hash.as_deref(), cutoff, keep_weekly);
+    println!(
+        "{} blob(s) older than {days} days would be deleted{}.",
+        doomed.len(),
+        if keep_weekly { " (keeping one per week)" } else { "" }
+    );
+    for h in &doomed {
+        println!("  {h}");
+    }
+    if !yes {
+        println!("Dry run -- nothing deleted. Re-run with --yes to delete (stop the server first).");
+        return Ok(());
+    }
+    for h in &doomed {
+        match std::fs::remove_file(history.join(format!("{h}.wks"))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => bail!("failed to delete {h}: {e}"),
+        }
+    }
+    for e in log.iter_mut().filter(|e| doomed.contains(&e.hash)) {
+        e.pruned = true;
+    }
+    atomic_write_sync(&log_path, serde_json::to_string_pretty(&log)?.as_bytes())?;
+    println!("Deleted {} blob(s).", doomed.len());
+    Ok(())
 }
 
 /* ------------------------------------------------------------------ */
@@ -736,18 +936,25 @@ async fn version_handler(State(state): State<Arc<AppState>>, headers: HeaderMap)
     if let Err(e) = check_auth(&state, &headers) {
         return e;
     }
-    let meta_path = state.cfg.storage_dir.join("meta.json");
-    Json(read_meta(&meta_path).await).into_response()
+    let _guard = state.lock.lock().await;
+    match load_state(&state.cfg.storage_dir, &state.cfg.history_dir).await {
+        Ok((meta, _)) => Json(meta).into_response(),
+        Err(e) => server_error(e),
+    }
 }
 
 async fn history_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(e) = check_auth(&state, &headers) {
         return e;
     }
-    let log_path = state.cfg.storage_dir.join("log.json");
-    let mut log = read_log(&log_path).await;
-    log.reverse();
-    Json(log).into_response()
+    let _guard = state.lock.lock().await;
+    match load_state(&state.cfg.storage_dir, &state.cfg.history_dir).await {
+        Ok((_, mut log)) => {
+            log.reverse();
+            Json(log).into_response()
+        }
+        Err(e) => server_error(e),
+    }
 }
 
 async fn pull_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -785,12 +992,18 @@ async fn restore_handler(
     let storage = &state.cfg.storage_dir;
     let history = &state.cfg.history_dir;
     let current_path = storage.join("vault.wks");
-    let meta_path = storage.join("meta.json");
-    let log_path = storage.join("log.json");
-    let meta = read_meta(&meta_path).await;
+    let (meta, log) = match load_state(storage, history).await {
+        Ok(v) => v,
+        Err(e) => return server_error(e),
+    };
 
     if meta.hash.as_deref() == Some(req.hash.as_str()) {
         return Json(serde_json::json!({"status": "ok", "mode": "no-op", "meta": meta})).into_response();
+    }
+
+    // Hash comes from the client: only accept plain hex so it can't escape history/.
+    if req.hash.is_empty() || !req.hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid hash"}))).into_response();
     }
 
     let target_path = history.join(format!("{}.wks", req.hash));
@@ -799,7 +1012,7 @@ async fn restore_handler(
             StatusCode::GONE,
             Json(serde_json::json!({
                 "error": format!(
-                    "no stored blob for hash {} -- it may have been pruned by retention policy (metadata still in /history)",
+                    "no stored blob for hash {} -- it was deleted by an explicit `prune` run (metadata still in /history)",
                     req.hash
                 )
             })),
@@ -807,38 +1020,22 @@ async fn restore_handler(
             .into_response();
     };
 
+    // Archive the current version first; if that fails, abort -- never overwrite unarchived data.
     if let Some(current_hash) = &meta.hash {
-        let _ = fs::create_dir_all(history).await;
-        let _ = fs::copy(&current_path, history.join(format!("{current_hash}.wks"))).await;
+        match fs::read(&current_path).await {
+            Ok(cur) => {
+                if let Err(e) = archive_blob(history, current_hash, &cur).await {
+                    return server_error(e);
+                }
+            }
+            Err(e) => return server_error(e),
+        }
     }
 
-    if let Err(e) = fs::write(&current_path, &target_blob).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    match commit_version(storage, &meta, log, &target_blob, "restore", "server-restore").await {
+        Ok(new_meta) => Json(serde_json::json!({"status": "ok", "mode": "restore", "meta": new_meta})).into_response(),
+        Err(e) => server_error(e),
     }
-
-    let new_meta = Meta {
-        hash: Some(req.hash.clone()),
-        updated_at: Some(now_iso()),
-        size: Some(target_blob.len() as u64),
-        version: Some(meta.version.unwrap_or(0) + 1),
-    };
-    let _ = write_meta(&meta_path, &new_meta).await;
-    let _ = append_log(
-        &log_path,
-        LogEntry {
-            version: new_meta.version.unwrap(),
-            hash: req.hash.clone(),
-            size: target_blob.len() as u64,
-            updated_at: new_meta.updated_at.clone().unwrap(),
-            mode: "restore".to_string(),
-            device_name: "server-restore".to_string(),
-            pruned: false,
-        },
-    )
-    .await;
-    prune_history(history, &log_path, state.cfg.retention_days).await;
-
-    Json(serde_json::json!({"status": "ok", "mode": "restore", "meta": new_meta})).into_response()
 }
 
 async fn push_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, mut multipart: Multipart) -> Response {
@@ -849,11 +1046,15 @@ async fn push_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, mu
     let mut file_bytes: Option<Bytes> = None;
     let mut expected_base_hash: Option<String> = None;
     let mut device_name = default_device_name();
+    let mut force = false;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name().unwrap_or("") {
             "file" => file_bytes = field.bytes().await.ok(),
-            "expected_base_hash" => expected_base_hash = field.text().await.ok(),
+            "expected_base_hash" => {
+                expected_base_hash = field.text().await.ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+            }
+            "force" => force = field.text().await.map(|t| t.trim() == "yes").unwrap_or(false),
             "device_name" => {
                 if let Ok(t) = field.text().await {
                     if !t.trim().is_empty() {
@@ -872,65 +1073,92 @@ async fn push_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, mu
         return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error": "over size limit"}))).into_response();
     }
 
+    // Refuse blobs that can't be read with our key: they would become the current
+    // version and make every later merge/restore of the vault fail.
+    if decrypt(&state.cfg.vault_key, &uploaded).ok().and_then(|z| zip_to_map(&z).ok()).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "upload is not a valid vault archive for this server's vault key; nothing was stored"})),
+        )
+            .into_response();
+    }
+
     let _guard = state.lock.lock().await;
 
     let storage = &state.cfg.storage_dir;
     let history = &state.cfg.history_dir;
     let current_path = storage.join("vault.wks");
-    let meta_path = storage.join("meta.json");
-    let log_path = storage.join("log.json");
-    let meta = read_meta(&meta_path).await;
+    let (meta, log) = match load_state(storage, history).await {
+        Ok(v) => v,
+        Err(e) => return server_error(e),
+    };
 
     let incoming_hash = sha256_hex(&uploaded);
 
-    if meta.hash.is_none() {
-        if let Err(e) = fs::write(&current_path, &uploaded[..]).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
-        }
-        let new_meta = Meta { hash: Some(incoming_hash.clone()), updated_at: Some(now_iso()), size: Some(uploaded.len() as u64), version: Some(1) };
-        let _ = write_meta(&meta_path, &new_meta).await;
-        let _ = append_log(&log_path, LogEntry {
-            version: 1, hash: incoming_hash, size: uploaded.len() as u64,
-            updated_at: new_meta.updated_at.clone().unwrap(), mode: "initial".to_string(),
-            device_name: device_name.clone(), pruned: false,
-        }).await;
-        let validation = validate_blob(&state.cfg.vault_key, &uploaded);
-        return Json(serde_json::json!({"status": "ok", "mode": "initial", "meta": new_meta, "validation": validation})).into_response();
+    // Every upload is kept in history before anything else happens, so even a bad
+    // merge can never lose what a device sent.
+    if let Err(e) = archive_blob(history, &incoming_hash, &uploaded).await {
+        return server_error(e);
     }
 
-    let current_hash = meta.hash.clone().unwrap();
-
-    if expected_base_hash.as_deref() == Some(current_hash.as_str()) || expected_base_hash.is_none() {
-        let _ = fs::create_dir_all(history).await;
-        let _ = fs::copy(&current_path, history.join(format!("{current_hash}.wks"))).await;
-        if let Err(e) = fs::write(&current_path, &uploaded[..]).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
-        }
-        let new_meta = Meta {
-            hash: Some(incoming_hash.clone()),
-            updated_at: Some(now_iso()),
-            size: Some(uploaded.len() as u64),
-            version: Some(meta.version.unwrap_or(0) + 1),
+    let Some(current_hash) = meta.hash.clone() else {
+        return match commit_version(storage, &meta, log, &uploaded, "initial", &device_name).await {
+            Ok(new_meta) => {
+                let validation = validate_blob(&state.cfg.vault_key, &uploaded);
+                Json(serde_json::json!({"status": "ok", "mode": "initial", "meta": new_meta, "validation": validation})).into_response()
+            }
+            Err(e) => server_error(e),
         };
-        let _ = write_meta(&meta_path, &new_meta).await;
-        let _ = append_log(&log_path, LogEntry {
-            version: new_meta.version.unwrap(), hash: incoming_hash, size: uploaded.len() as u64,
-            updated_at: new_meta.updated_at.clone().unwrap(), mode: "fast-forward".to_string(),
-            device_name: device_name.clone(), pruned: false,
-        }).await;
-        prune_history(history, &log_path, state.cfg.retention_days).await;
+    };
+
+    if incoming_hash == current_hash {
         let validation = validate_blob(&state.cfg.vault_key, &uploaded);
-        return Json(serde_json::json!({"status": "ok", "mode": "fast-forward", "meta": new_meta, "validation": validation})).into_response();
+        return Json(serde_json::json!({"status": "ok", "mode": "no-op", "meta": meta, "validation": validation})).into_response();
     }
 
-    let base_hash = expected_base_hash.unwrap();
+    // Archive the current version before it can be replaced; abort if that fails.
+    let remote_blob = match fs::read(&current_path).await {
+        Ok(b) => b,
+        Err(e) => return server_error(e),
+    };
+    if let Err(e) = archive_blob(history, &current_hash, &remote_blob).await {
+        return server_error(e);
+    }
+
+    let fast_forward = expected_base_hash.as_deref() == Some(current_hash.as_str());
+    if fast_forward || (expected_base_hash.is_none() && force) {
+        let mode = if fast_forward { "fast-forward" } else { "forced-overwrite" };
+        return match commit_version(storage, &meta, log, &uploaded, mode, &device_name).await {
+            Ok(new_meta) => {
+                let validation = validate_blob(&state.cfg.vault_key, &uploaded);
+                Json(serde_json::json!({"status": "ok", "mode": mode, "meta": new_meta, "validation": validation})).into_response()
+            }
+            Err(e) => server_error(e),
+        };
+    }
+
+    let Some(base_hash) = expected_base_hash else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "conflict",
+                "message": "the server already has a vault and no expected_base_hash was sent; pull first and push with expected_base_hash (or send force=yes to deliberately overwrite -- the old version stays in history)",
+                "current_hash": current_hash
+            })),
+        )
+            .into_response();
+    };
+
+    if base_hash.is_empty() || !base_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid expected_base_hash"}))).into_response();
+    }
     let base_path = history.join(format!("{base_hash}.wks"));
     let Ok(base_blob) = fs::read(&base_path).await else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "conflict",
-                "message": "server no longer has the base version (possibly pruned); pull the full current version and re-merge manually",
+                "message": "server does not have the base version (unknown hash, or deleted by an explicit prune); pull the full current version and re-merge manually. Your upload was saved in history.",
                 "current_hash": current_hash
             })),
         )
@@ -938,7 +1166,6 @@ async fn push_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, mu
     };
 
     let merge_computation = (|| -> Result<(Vec<u8>, Vec<String>, FileMap)> {
-        let remote_blob = std::fs::read(&current_path)?;
         let base_zip = decrypt(&state.cfg.vault_key, &base_blob)?;
         let remote_zip = decrypt(&state.cfg.vault_key, &remote_blob)?;
         let incoming_zip = decrypt(&state.cfg.vault_key, &uploaded)?;
@@ -953,28 +1180,13 @@ async fn push_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, mu
 
     let (merged_blob, conflicts, merged_map) = match merge_computation {
         Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => return server_error(e),
     };
 
-    let _ = fs::create_dir_all(history).await;
-    let _ = fs::copy(&current_path, history.join(format!("{current_hash}.wks"))).await;
-    if let Err(e) = fs::write(&current_path, &merged_blob).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
-    }
-    let merged_hash = sha256_hex(&merged_blob);
-    let new_meta = Meta {
-        hash: Some(merged_hash.clone()),
-        updated_at: Some(now_iso()),
-        size: Some(merged_blob.len() as u64),
-        version: Some(meta.version.unwrap_or(0) + 1),
+    let new_meta = match commit_version(storage, &meta, log, &merged_blob, "merged", &device_name).await {
+        Ok(m) => m,
+        Err(e) => return server_error(e),
     };
-    let _ = write_meta(&meta_path, &new_meta).await;
-    let _ = append_log(&log_path, LogEntry {
-        version: new_meta.version.unwrap(), hash: merged_hash, size: merged_blob.len() as u64,
-        updated_at: new_meta.updated_at.clone().unwrap(), mode: "merged".to_string(),
-        device_name: device_name.clone(), pruned: false,
-    }).await;
-    prune_history(history, &log_path, state.cfg.retention_days).await;
 
     let validation = validate_map(&merged_map);
 
@@ -994,6 +1206,10 @@ async fn push_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, mu
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|a| a.as_str()) == Some("prune") {
+        return run_prune(&args[1..]);
+    }
     let cfg = load_config()?;
     std::fs::create_dir_all(&cfg.storage_dir)?;
     std::fs::create_dir_all(&cfg.history_dir)?;
@@ -1020,4 +1236,63 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(hash: &str, ts: u64) -> LogEntry {
+        LogEntry { version: 1, hash: hash.into(), size: 1, updated_at: format!("unix:{ts}"), mode: "x".into(), device_name: "d".into(), pruned: false }
+    }
+
+    #[test]
+    fn prune_never_touches_current_or_recent_or_shared_blobs() {
+        let log = vec![entry("old", 100), entry("shared", 200), entry("cur", 300), entry("shared", 10_000), entry("new", 10_000)];
+        let doomed = plan_prune(&log, Some("cur"), 5_000, false);
+        assert_eq!(doomed, HashSet::from(["old".to_string()]));
+    }
+
+    #[test]
+    fn prune_keep_weekly_keeps_one_per_week() {
+        let w = WEEK_SECS;
+        let log = vec![entry("a", w), entry("b", w + 5), entry("c", 2 * w)];
+        let doomed = plan_prune(&log, None, 10 * w, true);
+        assert_eq!(doomed, HashSet::from(["a".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn atomic_write_replaces_without_leftovers() {
+        let dir = std::env::temp_dir().join(format!("wks-test-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("f");
+        atomic_write(&p, b"one").await.unwrap();
+        atomic_write(&p, b"two").await.unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_log_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("wks-test-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("log.json"), "{not json").unwrap();
+        assert!(load_state(&dir, &dir.join("history")).await.is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("log.json")).unwrap(), "{not json");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_meta_is_rebuilt_from_vault_and_archived() {
+        let dir = std::env::temp_dir().join(format!("wks-test-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vault.wks"), b"blob").unwrap();
+        let (meta, log) = load_state(&dir, &dir.join("history")).await.unwrap();
+        let h = sha256_hex(b"blob");
+        assert_eq!(meta.hash.as_deref(), Some(h.as_str()));
+        assert_eq!(log.len(), 1);
+        assert!(dir.join("history").join(format!("{h}.wks")).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

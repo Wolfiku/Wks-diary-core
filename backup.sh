@@ -13,7 +13,8 @@ STORAGE_DIR="${STORAGE_DIR:-/opt/wks-diary-core/storage}"
 BACKUP_TARGET="${BACKUP_TARGET:-user@backup-host:/backups/wks-diary-core/}"
 
 echo "[$(date -Iseconds)] starting backup of $STORAGE_DIR -> $BACKUP_TARGET"
-rsync -az --delete "$STORAGE_DIR/" "$BACKUP_TARGET"
+# No --delete: files removed from STORAGE_DIR (e.g. by an explicit `prune`) stay in the backup.
+rsync -az "$STORAGE_DIR/" "$BACKUP_TARGET"
 echo "[$(date -Iseconds)] backup done"
 
 # Alternative using restic (better for versioned/deduplicated backups):

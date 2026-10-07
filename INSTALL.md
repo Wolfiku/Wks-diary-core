@@ -70,7 +70,6 @@ Every variable, what it does, and safe defaults:
 | `MAX_UPLOAD_BYTES` | Upload size cap. | 50 MB |
 | `BIND_ADDR` | Listen address. Must be loopback unless you opt in below. | `127.0.0.1:8080` |
 | `WKS_ALLOW_PUBLIC_BIND` | Set to `yes` only if you really want to skip a reverse proxy. | `no` |
-| `RETENTION_DAYS` | Full history kept this long; older blobs pruned to weekly snapshots. | 30 |
 | `RATE_LIMIT_MAX_FAILURES` | Failed auth attempts allowed per window before `429`. | 10 |
 | `RATE_LIMIT_WINDOW_SECS` | Length of that window. | 60 |
 
@@ -179,7 +178,15 @@ curl -X POST -H "X-API-KEY: <WKS_API_KEY>" -H "Content-Type: application/json" \
      -d '{"hash": "<past-hash>"}' https://your-domain.tld/restore
 ```
 
-If a version shows as pruned, its content is gone per your `RETENTION_DAYS` setting but the metadata (hash, timestamp, size, device) stays visible forever; restoring a pruned hash returns `410 Gone`.
+Old versions are never deleted automatically. To free space deliberately (stop the server first):
+
+```bash
+cd rust
+./target/release/wks-server prune --older-than-days 90                 # dry run
+./target/release/wks-server prune --older-than-days 90 --keep-weekly --yes
+```
+
+The current version is never deleted. A pruned version keeps its metadata in `/history`; restoring it returns `410 Gone`.
 
 ## 12. Off-site backups
 
@@ -202,7 +209,7 @@ cargo build --release
 sudo systemctl restart wks-diary-core   # or re-attach your tmux session
 ```
 
-Your `.env` and `storage/` are untouched by a `git pull` since they're not tracked in the repository -- only the code changes.
+Updates never delete or migrate stored data (old `RETENTION_DAYS` settings are simply ignored). Your `.env` and `storage/` are untouched by a `git pull` since they're not tracked in the repository -- only the code changes.
 
 ## 14. Troubleshooting
 
@@ -212,7 +219,7 @@ Your `.env` and `storage/` are untouched by a `git pull` since they're not track
 | "failed to read passphrase from stdin" on startup | Using Mode B under systemd (no TTY) | Either switch to Mode A, or run manually via tmux/screen instead of systemd |
 | `401 unauthorized` from every request | Wrong or missing `X-API-KEY` header | Double-check the header name casing and that the client's key matches the server's `WKS_API_KEY` exactly |
 | `429 too many failed auth attempts` | Rate limiter tripped, usually from a typo'd key retried repeatedly | Wait out `RATE_LIMIT_WINDOW_SECS`, then double-check the key |
-| `409 conflict` on push that never resolves | The base version referenced by the client is no longer in `storage/history/` (may have been pruned) | Pull the current version fresh, re-apply your local edits, and push again without an `expected_base_hash` |
-| `410 Gone` on restore | That version's blob was pruned by retention policy | Only the metadata survives; the content itself is unrecoverable if it was pruned |
+| `409 conflict` on push that never resolves | The base version is unknown/was explicitly pruned, or no `expected_base_hash` was sent | Pull the current version fresh, re-apply your local edits, and push with the new `expected_base_hash` (or `force=yes` to deliberately overwrite -- the old version stays in history) |
+| `410 Gone` on restore | That version's blob was deleted by an explicit `prune` run | Only the metadata survives; the content itself is unrecoverable if it was pruned |
 | Push succeeds but `validation.errors` is non-empty | A `people/*.md` file is missing its definition line, or has a filename mismatch | Fix the flagged file locally, then push again |
 | `cargo build` fails on a fresh server | Missing C toolchain or OpenSSL headers | Install your distro's build-essential/gcc package and retry |

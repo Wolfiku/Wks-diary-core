@@ -1,6 +1,6 @@
 [package]
 name = "wks-diary-core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "wks-diary-core backend: stores, serves, merges (line-level), versions, and prunes encrypted vault blobs"
 
