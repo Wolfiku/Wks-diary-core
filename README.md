@@ -33,11 +33,21 @@ A normal notes app has one copy of the truth, and if two devices edit it at once
 3. If the server has moved on (another device pushed first), the backend fetches the base, the server's current version, and your incoming push -- all encrypted -- decrypts them in memory, and runs a **line-level three-way merge** per file (via the `similar` diff engine): a diff of base-to-remote and base-to-incoming, walked together.
    - Non-overlapping edits (you added a paragraph, another device fixed a typo elsewhere) merge with zero manual work.
    - Only genuinely overlapping edits to the same lines get conflict markers, and only around that one stretch -- never the whole file.
-4. The merged result becomes the new current version. The version you overwrote is archived, never deleted outright.
+4. The merged result becomes the new current version. The version you overwrote **and** the raw upload you sent are both archived first, so nothing is lost even if a merge turns out badly.
 
 ## 4. History and restore
 
-Every push -- fast-forward, merge, or restore itself -- is one entry in an append-only log: hash, timestamp, size, which device made it, and whether it was a clean push or a merge. `history` shows this newest-first, like `git log`. `restore` takes any past hash and makes it current again, archiving whatever was current first -- so restoring is itself undoable. Old blobs beyond your configured retention window get pruned down to one snapshot per week to keep storage bounded, but the log entry (hash, timestamp, device) survives forever even after the content is gone -- you always know *that* a version existed, even once its bytes are gone.
+Every push -- fast-forward, merge, or restore itself -- is one entry in an append-only log: hash, timestamp, size, which device made it, and whether it was a clean push or a merge. `history` shows this newest-first, like `git log`. `restore` takes any past hash and makes it current again, archiving whatever was current first -- so restoring is itself undoable. **Nothing is ever deleted automatically.** Old blobs stay until you explicitly run `wks-server prune --older-than-days N [--keep-weekly] --yes` (dry run without `--yes`). Even then the current version is never touched, and the log entry (hash, timestamp, device) survives forever.
+
+### Data-safety guarantees (v0.5.0)
+
+- No automatic pruning/retention -- deleting old data always needs an explicit command.
+- Every upload is archived in `history/` before it is merged or replaces anything; the current version is archived before it is overwritten, and if archiving fails the push/restore is aborted.
+- All files (`vault.wks`, `meta.json`, `log.json`, history blobs) are written atomically (temp file + fsync + rename), so a crash can't leave truncated data.
+- A corrupt `log.json` is never overwritten with an empty one (the server refuses to continue and keeps a `.corrupt-*` copy); a missing/corrupt/stale `meta.json` is rebuilt from the real `vault.wks`.
+- Uploads that can't be decrypted with the server's vault key are rejected (HTTP 400) and never become the current version.
+- A push without `expected_base_hash` onto an existing vault is rejected (HTTP 409) unless `force=yes` is sent, so a device can't silently overwrite another device's state.
+- `backup.sh` no longer uses `rsync --delete`.
 
 ## 5. Data model
 
@@ -62,11 +72,11 @@ Markup syntax (`*name*` mentions, `[[links]]`, `#tags`, alias definitions) is do
 
 - `GET /version` -> current `{hash, updated_at, size, version}`
 - `GET /pull` -> streams the current encrypted vault
-- `POST /push` -> multipart `file` (+ `expected_base_hash`, `device_name`); fast-forwards or line-level merges, returns a validation report
+- `POST /push` -> multipart `file` (+ `expected_base_hash`, `device_name`, optional `force=yes`); fast-forwards or line-level merges, returns a validation report
 - `GET /history` -> full version log, newest first
 - `POST /restore` -> `{"hash": "..."}`, makes a past version current again
 
-Config via `.env` (see `rust/env.example.txt`): `WKS_API_KEY`, `WKS_VAULT_KEY` or `WKS_VAULT_SALT`, `STORAGE_DIR`, `MAX_UPLOAD_BYTES`, `BIND_ADDR` + `WKS_ALLOW_PUBLIC_BIND`, `RETENTION_DAYS`, `RATE_LIMIT_MAX_FAILURES`, `RATE_LIMIT_WINDOW_SECS`.
+Config via `.env` (see `rust/env.example.txt`): `WKS_API_KEY`, `WKS_VAULT_KEY` or `WKS_VAULT_SALT`, `STORAGE_DIR`, `MAX_UPLOAD_BYTES`, `BIND_ADDR` + `WKS_ALLOW_PUBLIC_BIND`, `RATE_LIMIT_MAX_FAILURES`, `RATE_LIMIT_WINDOW_SECS`.
 
 ## 8. Repository layout
 
